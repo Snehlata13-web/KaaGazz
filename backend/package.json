@@ -1,0 +1,32 @@
+{
+  "name": "kaagazz-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node local-server.js",
+    "dev": "nodemon local-server.js",
+    "check": "node --check local-server.js && node --check lambda-api.js && node --check lambda-worker.js && node --check lambda-scheduler.js && node -e \"process.env.JWT_SECRET='x'.repeat(32);process.env.SQS_QUEUE_URL='https://example.invalid/q';require('./src/app.js');console.log('app loads OK')\"",
+    "seed:test-users": "node scripts/seed-test-users.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1149.0",
+    "@aws-sdk/client-sqs": "^3.1149.0",
+    "@aws-sdk/lib-dynamodb": "^3.1149.0",
+    "@codegenie/serverless-express": "^5.0.0",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.7",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.1",
+    "jsonwebtoken": "^9.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}

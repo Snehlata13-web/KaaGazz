@@ -1,0 +1,328 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EcoPaper Connect serverless backend (API Gateway + CloudFront CDN)
+
+Parameters:
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+  AdminEmail:
+    Type: String
+  AdminPasswordHash:
+    Type: String
+    NoEcho: true
+  CorsAllowedOrigins:
+    Type: String
+    Default: ''
+    Description: >-
+      Comma-separated browser origins allowed to call the API, e.g.
+      https://main.d123.amplifyapp.com. Leave empty to allow every origin
+      (development only).
+
+  CloudFrontPriceClass:
+    Type: String
+    Default: PriceClass_200
+    AllowedValues:
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+    Description: >-
+      PriceClass_200 is the cheapest class that still includes Indian and wider
+      Asian edge locations, which matters because the origin is in Sydney.
+      PriceClass_100 (US/EU only) would send Indian users across the Pacific.
+
+  CacheTtlSeconds:
+    Type: String
+    Default: '60'
+    Description: >-
+      Lifetime of the cached admin aggregates. The cache lives inside each warm
+      Lambda container, so one container cannot evict another's copy; this TTL
+      is therefore what bounds how stale an aggregate can be. Keep it short.
+
+Conditions:
+  HasCorsOrigins: !Not [!Equals [!Ref CorsAllowedOrigins, '']]
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref EcoPaperDataTable
+        DYNAMODB_GSI: GSI1
+        DYNAMODB_ACCOUNT_GSI: GSI2
+        DYNAMODB_APPROVAL_GSI: GSI3
+        SQS_QUEUE_URL: !Ref CollectionRequestQueue
+        AUTO_PICKUP_THRESHOLD_KG: '200'
+        DEFAULT_KG_PER_BAG: '20'
+        JWT_SECRET: !Ref JwtSecret
+        JWT_EXPIRES_IN: 1h
+        ADMIN_EMAIL: !Ref AdminEmail
+        ADMIN_PASSWORD_HASH: !Ref AdminPasswordHash
+        RETURN_RESET_TOKEN: 'false'
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+        CORS_ALLOWED_ORIGINS: !Ref CorsAllowedOrigins
+        CACHE_AGGREGATE_TTL_SECONDS: !Ref CacheTtlSeconds
+
+Resources:
+  # ---------------------------------------------------------------
+  # API Gateway (explicit, so throttling and access logs are owned here)
+  # ---------------------------------------------------------------
+
+  # Previously this API was implicit: the HttpApi event on the function made SAM
+  # generate a 'ServerlessHttpApi' resource with no throttling, no access logs
+  # and no stage control. Declaring it explicitly is what makes those settings
+  # reachable. CORS is deliberately NOT configured here - Express owns it, so
+  # there is exactly one place that can emit Access-Control-* headers and no
+  # risk of duplicate values.
+  EcoPaperHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      DefaultRouteSettings:
+        # A single Lambda fronts every route, so this ceiling is the backstop
+        # that stops a traffic spike turning into an unbounded Lambda and
+        # DynamoDB bill. The per-caller limits live in the app.
+        ThrottlingRateLimit: 100
+        ThrottlingBurstLimit: 200
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latency":"$context.responseLatency","integrationStatus":"$context.integrationStatus","error":"$context.error.message"}'
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${AWS::StackName}'
+      # Bounded retention; the default is never-expire, which quietly accrues
+      # storage cost forever.
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------
+  # CloudFront CDN in front of the API
+  # ---------------------------------------------------------------
+
+  # Caching is off for /api/* on purpose. Every data route is authenticated and
+  # tenant-specific, so edge-caching it would require the bearer token in the
+  # cache key, tying cache correctness to token lifetime for little gain. The
+  # expensive DynamoDB work is cached at the origin instead (cache.service.js),
+  # which is the right layer for per-tenant data.
+  #
+  # What the distribution is actually for: TLS and HTTP/3 terminated at the
+  # edge near the user, warm keep-alive connections to the Sydney origin,
+  # response compression, one stable domain, and a place to attach WAF or a
+  # custom domain later without touching the application.
+  ApiNoCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-api-no-cache'
+        Comment: Pass-through for authenticated API routes, with compression enabled
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          # These fields are required by the CloudFront schema. Keep them off
+          # because this policy has zero TTLs and is intentionally not cached.
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  ApiDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} API edge'
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref CloudFrontPriceClass
+        Origins:
+          - Id: HttpApiOrigin
+            DomainName: !Sub '${EcoPaperHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginKeepaliveTimeout: 30
+              OriginReadTimeout: 30
+        DefaultCacheBehavior:
+          TargetOriginId: HttpApiOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: !Ref ApiNoCachePolicy
+          # Managed-AllViewerExceptHostHeader. Forwards every header, cookie and
+          # query string to the origin but drops Host, which is mandatory for an
+          # API Gateway origin: forwarding the CloudFront Host would make API
+          # Gateway reject the request as an unknown domain.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CacheBehaviors:
+          # The only genuinely public, non-tenant response, so the only one
+          # worth caching at the edge. Also keeps uptime probes off the Lambda.
+          - PathPattern: /health
+            TargetOriginId: HttpApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            # Managed-CachingOptimized; honours the origin's Cache-Control,
+            # which app.js sets to max-age=10.
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  # ---------------------------------------------------------------
+  # Functions
+  # ---------------------------------------------------------------
+
+  EcoPaperApi:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: lambda-api.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EcoPaperDataTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt CollectionRequestQueue.QueueName
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EcoPaperHttpApi
+            Path: /{proxy+}
+            Method: ANY
+
+  CollectionRequestWorker:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: lambda-worker.handler
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EcoPaperDataTable
+      Events:
+        CollectionQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt CollectionRequestQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  AutomaticDispatchScheduler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: lambda-scheduler.handler
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EcoPaperDataTable
+      Events:
+        DailyDispatchSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Enabled: true
+
+  # ---------------------------------------------------------------
+  # Data
+  # ---------------------------------------------------------------
+
+  EcoPaperDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EcoPaperData
+      BillingMode: PAY_PER_REQUEST
+      # db.service.js writes a 'ttl' attribute on password-reset rows, but TTL
+      # was never enabled on the table, so those rows were never reaped and
+      # accumulated forever. DynamoDB deletes them for free; app code still
+      # re-checks expiry, since TTL deletion is only best-effort within 48h.
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1_PK
+          AttributeType: S
+        - AttributeName: GSI1_SK
+          AttributeType: S
+        - AttributeName: GSI2_PK
+          AttributeType: S
+        - AttributeName: GSI2_SK
+          AttributeType: S
+        - AttributeName: GSI3_PK
+          AttributeType: S
+        - AttributeName: GSI3_SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1_PK
+              KeyType: HASH
+            - AttributeName: GSI1_SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2_PK
+              KeyType: HASH
+            - AttributeName: GSI2_SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI3
+          KeySchema:
+            - AttributeName: GSI3_PK
+              KeyType: HASH
+            - AttributeName: GSI3_SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  CollectionRequestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CollectionRequestDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  CollectionRequestDeadLetterQueue:
+    Type: AWS::SQS::Queue
+
+Outputs:
+  CdnUrl:
+    Description: CloudFront endpoint; point the frontend VITE_API_URL here
+    Value: !Sub 'https://${ApiDistribution.DomainName}/api'
+  ApiUrl:
+    Description: Direct API Gateway origin (bypasses the CDN; useful for debugging)
+    Value: !Sub 'https://${EcoPaperHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  DistributionId:
+    Description: CloudFront distribution id, for cache invalidations
+    Value: !Ref ApiDistribution
+  TableName:
+    Value: !Ref EcoPaperDataTable
+  QueueUrl:
+    Value: !Ref CollectionRequestQueue
+  CorsMode:
+    Description: Whether the API restricts browser origins
+    Value: !If [HasCorsOrigins, !Ref CorsAllowedOrigins, 'ALL ORIGINS ALLOWED - set CorsAllowedOrigins']
